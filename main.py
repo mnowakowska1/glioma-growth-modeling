@@ -4,17 +4,17 @@ import numpy as np
 import matplotlib.pyplot as plt
 import nibabel as nib
 
-# set backend
-matplotlib.use('TkAgg')
+# # set backend
+# matplotlib.use('TkAgg')
 
 # --- configuration ---
-patient_id = "0015_01"
+patient_id = "0003_01"
 base_dir = "/Users/marysianowakowska/Downloads/TCIA_testdataset/testset_TCIA/"
 
 # --- simulation constants ---
 dx = 0.1
 max_iterations = 25
-simulation_steps = 500
+simulation_steps = 600
 final_vis_threshold = 0.05
 
 # paths setup
@@ -207,19 +207,34 @@ def main():
     print(f"\nfinal result. dice: {dice:.4f} | d: {best_d:.2f} | rho: {best_rho:.2f}")
 
     # 5. visualization
-    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+    fig, axes = plt.subplots(1, 3, figsize=(15, 6))
+
+    fig.suptitle(f"patient no: {patient_id}", fontsize=16, fontweight='bold', y=0.93)
+
     bg = flair_norm * 0.5
+
+    # plot 1: ground truth
     axes[0].imshow(bg.T, cmap='gray', origin='lower')
-    axes[0].imshow(np.ma.masked_where(target_mask == 0, target_mask).T, cmap='autumn', origin='lower', alpha=0.8)
-    axes[0].set_title("target (ground truth)")
+    axes[0].imshow(np.ma.masked_where(target_mask == 0, target_mask).T,
+                   cmap='autumn', origin='lower', alpha=0.8)
+    axes[0].set_title("target (ground truth)", pad=10)
+
+    # plot 2: starting point
     axes[1].imshow(bg.T, cmap='gray', origin='lower')
-    axes[1].imshow(np.ma.masked_where(u_initial == 0, u_initial).T, cmap='autumn', origin='lower', alpha=1.0)
-    axes[1].set_title("seed (starting point)")
+    axes[1].imshow(np.ma.masked_where(u_initial == 0, u_initial).T,
+                   cmap='autumn', origin='lower', alpha=1.0)
+    axes[1].set_title("seed (starting point)", pad=10)
+
+    # plot 3: simulation result
     axes[2].imshow(bg.T, cmap='gray', origin='lower')
     res_mask = (best_sim > final_vis_threshold).astype(float)
-    axes[2].imshow(np.ma.masked_where(res_mask == 0, res_mask).T, cmap='autumn', origin='lower', alpha=0.8)
-    axes[2].set_title(f"sim result (dice: {dice:.2f})")
-    plt.tight_layout(); plt.show()
+    axes[2].imshow(np.ma.masked_where(res_mask == 0, res_mask).T,
+                   cmap='autumn', origin='lower', alpha=0.8)
+    axes[2].set_title(f"sim result (dice: {dice:.2f})", pad=10)
+
+    plt.subplots_adjust(top=0.85, bottom=0.05, left=0.05, right=0.95, wspace=0.2)
+
+    plt.show()
 
 
 if __name__ == "__main__":
