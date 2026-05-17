@@ -1,252 +1,185 @@
+import os
 import matplotlib
 matplotlib.use('TkAgg')
-
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 import nibabel as nib
 
-
 # --- constants ---
 DX = 0.1
 MAX_ITERATIONS = 20
-SIMULATION_STEPS = 200
-# final threshold to binarize the fuzzy simulation for sharp visualization
-FINAL_VIS_THRESHOLD = 0.15
+SIMULATION_STEPS = 400
+FINAL_VIS_THRESHOLD = 0.05
+BASE_PATH = '/Users/marysianowakowska/Downloads/TCIA_testdataset/testset_TCIA/UCSD-PTGBM-0004_01/'
 
+def load_normalized_slice(filename: str, slice_idx: int) -> np.ndarray:
+    """loads a nifti file and normalizes its specific slice robustly to [0, 1]."""
+    filepath = os.path.join(BASE_PATH, filename)
+    img = nib.load(filepath)
+    data = img.get_fdata()
+    slice_data = data[:, :, slice_idx]
+    p99 = np.percentile(slice_data, 99.5)
+    if p99 > 0:
+        normalized = slice_data / p99
+        return np.clip(normalized, 0.0, 1.0)
+    return slice_data
 
-def calculate_diffusion(u: np.ndarray, dx: float, diff_map: np.ndarray) -> np.ndarray:
-    """calculates laplacian using 5-point stencil and applies heterogeneous diffusion map."""
-    # correct numpy indexing: axis 0 (rows/y), axis 1 (cols/x)
-    u_up = u[:-2, 1:-1]
-    u_down = u[2:, 1:-1]
-    u_left = u[1:-1, :-2]
-    u_right = u[1:-1, 2:]
-    u_mid = u[1:-1, 1:-1]
+def calculate_diffusion_anisotropic(u: np.ndarray, dx: float, diff_map: np.ndarray,
+                                    flair_slice: np.ndarray) -> np.ndarray:
+    """calculates anisotropic diffusion guided by image structure (pseudo-dti)."""
+    # 1. gradienty anatomii (bariery i drogi w mózgu)
+    grad_y, grad_x = np.gradient(flair_slice, dx)
+    # 2. gradienty stężenia nowotworu
+    u_grad_y, u_grad_x = np.gradient(u, dx)
+    # 3. waga krawędzi - hamuje dyfuzję w poprzek silnych struktur (np. naczyń, barier)
+    edge_weight = 1.0 / (1.0 + (grad_x**2 + grad_y**2) * 50.0)
 
-    laplacian = (u_up + u_down + u_left + u_right - 4 * u_mid) / (dx ** 2)
+    flux_x = diff_map * edge_weight * u_grad_x
+    flux_y = diff_map * edge_weight * u_grad_y
 
-    # apply brain tissue heterogenity
-    return laplacian * diff_map[1:-1, 1:-1]
+    # 4. dywergencja strumienia (anizotropowy laplasjan)
+    _, d_flux_x = np.gradient(flux_x, dx)
+    d_flux_y, _ = np.gradient(flux_y, dx)
+    return d_flux_x + d_flux_y
 
-
-def calculate_reaction(u: np.ndarray, rho: float) -> np.ndarray:
-    """calculates logistic growth."""
-    return u * rho * (1 - u)
-
+def calculate_reaction(u: np.ndarray, rho_map: np.ndarray) -> np.ndarray:
+    """calculates logistic growth using a heterogeneous proliferation map (asl)."""
+    return u * rho_map * (1 - u)
 
 def calculate_dice(sim_mask: np.ndarray, target_mask: np.ndarray) -> float:
-    """calculates dice similarity coefficient between simulation and ground truth."""
-    # low threshold for optimizer to 'see' early growth, high for gt
-    sim_binary = (sim_mask > 0.05).astype(int)
+    """calculates dice similarity coefficient between simulation and target."""
+    sim_binary = (sim_mask > 0.01).astype(int)
     target_binary = (target_mask > 0.5).astype(int)
-
     intersection = np.logical_and(sim_binary, target_binary).sum()
     total_area = sim_binary.sum() + target_binary.sum()
+    return (2.0 * intersection) / total_area if total_area > 0 else 0.0
 
-    if total_area == 0:
-        return 0.0
-    return (2.0 * intersection) / total_area
+def run_simulation(base_diff_map: np.ndarray, base_rho_map: np.ndarray, u_initial: np.ndarray,
+                   d_mult: float, rho_mult: float, dx: float, steps: int,
+                   flair_slice: np.ndarray) -> np.ndarray:
+    """runs the simulation using structure-guided anisotropic diffusion."""
+    current_diff_map = base_diff_map * d_mult
+    current_rho_map = base_rho_map * rho_mult
+    max_d = np.max(current_diff_map)
+    dt = (dx ** 2 / (4 * max_d)) * 0.4 if max_d > 0 else 0.01
+    u_old = np.copy(u_initial)
+    u_new = np.copy(u_initial)
 
-
-def run_simulation(diff_map: np.ndarray, rho: float, dt: float, dx: float,
-                   steps: int, start_x: int, start_y: int) -> np.ndarray:
-    """runs the simulation without visualization (fast mode)."""
-    # ensure correct data dimensions from nibabel (X, Y)
-    size_x, size_y = diff_map.shape
-    u_old = np.zeros((size_x, size_y))
-    u_new = np.zeros((size_x, size_y))
-
-    # patient zero at correct orientation
-    u_old[start_x, start_y] = 1.0
-
-    # finite difference time loop
     for _ in range(steps):
         u_core = u_old[1:-1, 1:-1]
+        rho_core = current_rho_map[1:-1, 1:-1]
+        # wywołanie dyfuzji sterowanej anatomią
+        diff = calculate_diffusion_anisotropic(u_old, dx, current_diff_map, flair_slice)
+        react = calculate_reaction(u_core, rho_core)
+        u_new[1:-1, 1:-1] = u_core + dt * (diff[1:-1, 1:-1] + react)
 
-        diff = calculate_diffusion(u_old, dx, diff_map)
-        react = calculate_reaction(u_core, rho)
-
-        u_new[1:-1, 1:-1] = u_core + dt * (diff + react)
-
-        # neumann boundary conditions (reflecting edges)
+        # warunki brzegowe (Neumann)
         u_new[0, :] = u_new[1, :]
         u_new[-1, :] = u_new[-2, :]
         u_new[:, 0] = u_new[:, 1]
         u_new[:, -1] = u_new[:, -2]
-
         u_old[:] = u_new[:]
-
     return u_old
 
-
-def evaluate_cost(diff_map: np.ndarray, rho: float, dt: float, dx: float,
-                  steps: int, start_x: int, start_y: int, target_mask: np.ndarray) -> tuple:
-    """runs simulation and returns dice score along with the result matrix."""
-    sim_result = run_simulation(diff_map, rho, dt, dx, steps, start_x, start_y)
+def evaluate_cost(base_diff_map: np.ndarray, base_rho_map: np.ndarray, u_initial: np.ndarray,
+                  d_mult: float, rho_mult: float, dx: float, steps: int,
+                  target_mask: np.ndarray, flair_slice: np.ndarray) -> tuple:
+    """runs simulation and evaluates its accuracy."""
+    sim_result = run_simulation(base_diff_map, base_rho_map, u_initial, d_mult, rho_mult, dx, steps, flair_slice)
     dice = calculate_dice(sim_result, target_mask)
     return dice, sim_result
 
-
-def custom_hill_climbing(target_mask: np.ndarray, base_diff_map: np.ndarray,
-                         dt: float, dx: float, steps: int, start_x: int, start_y: int) -> tuple:
-    """custom adaptive hill climbing algorithm to find optimal d and rho."""
-    current_d_mult = 1.0
-    current_rho = 0.05
-    step_d = 0.5
-    step_rho = 0.02
+def custom_hill_climbing(target_mask: np.ndarray, base_diff_map: np.ndarray, base_rho_map: np.ndarray,
+                         u_initial: np.ndarray, dx: float, steps: int, start_d: float, start_rho: float,
+                         flair_slice: np.ndarray) -> tuple: # <-- dodany flair_slice
+    """adaptive hill climbing algorithm exploring 2d parameter space."""
+    current_d_mult, current_rho_mult = start_d, start_rho
+    step_d, step_rho = 0.25, 0.05
 
     best_dice, best_sim = evaluate_cost(
-        base_diff_map * current_d_mult, current_rho, dt, dx, steps, start_x, start_y, target_mask
+        base_diff_map, base_rho_map, u_initial, current_d_mult, current_rho_mult, dx, steps, target_mask, flair_slice
     )
-    print(f"start: d_mult={current_d_mult:.2f}, rho={current_rho:.3f} | dice: {best_dice:.4f}")
+    print(f"hill climbing start: d={current_d_mult:.2f}, rho={current_rho_mult:.2f} | dice: {best_dice:.4f}")
 
     for _ in range(MAX_ITERATIONS):
-        # define 4 search directions (up, down, left, right)
-        neighbors = [
-            (current_d_mult + step_d, current_rho),
-            (current_d_mult - step_d, current_rho),
-            (current_d_mult, current_rho + step_rho),
-            (current_d_mult, current_rho - step_rho)
-        ]
-
+        neighbors = [(current_d_mult + step_d, current_rho_mult), (current_d_mult - step_d, current_rho_mult),
+                     (current_d_mult, current_rho_mult + step_rho), (current_d_mult, current_rho_mult - step_rho)]
         found_better = False
-
         for test_d, test_rho in neighbors:
-            # security: prevent overflow and non-physical parameters
-            if test_d <= 0.1 or test_rho <= 0.001 or test_d > 2.0:
-                continue
-
-            test_diff_map = base_diff_map * test_d
+            if test_d <= 0.05 or test_rho <= 0.01 or test_d > 3.0: continue
             score, sim_result = evaluate_cost(
-                test_diff_map, test_rho, dt, dx, steps, start_x, start_y, target_mask
+                base_diff_map, base_rho_map, u_initial, test_d, test_rho, dx, steps, target_mask, flair_slice
             )
-
             if score > best_dice:
-                best_dice = score
-                best_sim = sim_result
-                current_d_mult = test_d
-                current_rho = test_rho
+                best_dice, best_sim = score, sim_result
+                current_d_mult, current_rho_mult = test_d, test_rho
                 found_better = True
-                print(f" -> step taken! d_mult={current_d_mult:.2f}, rho={current_rho:.3f} | dice: {best_dice:.4f}")
-
+                print(f" -> step: d={current_d_mult:.2f}, rho={current_rho_mult:.2f} | dice: {best_dice:.4f}")
         if not found_better:
-            step_d *= 0.5
-            step_rho *= 0.5
-            print(f" -> local peak. reducing step: step_d={step_d:.3f}, step_rho={step_rho:.4f}")
-
-        if step_d < 0.05 and step_rho < 0.005:
-            print("required precision reached. stopping optimization.")
-            break
-
-    return current_d_mult, current_rho, best_dice, best_sim
-
+            step_d *= 0.5; step_rho *= 0.5
+            if step_d < 0.02 and step_rho < 0.01: break
+    return current_d_mult, current_rho_mult, best_dice, best_sim
 
 def create_crisp_tumor_mask(fuzzy_simulation: np.ndarray, threshold: float) -> np.ndarray:
-    """binarizes the fuzzy simulation output to create a masked, crisp shape."""
-    # creatingmasked array to show only tumor, making background transparent
+    """binarizes the continuous simulation output for crisp visualization overlay."""
     crisp_mask = (fuzzy_simulation > threshold).astype(float)
     return np.ma.masked_where(crisp_mask == 0, crisp_mask)
 
-
 def main():
-    """main program execution."""
-    print("loading patient data (tumor mask)...")
-    mask_path = '/Users/marysianowakowska/Downloads/TCIA_testdataset/testset_TCIA/UCSD-PTGBM-0004_01/UCSD-PTGBM-0004_01_BraTS_tumor_seg.nii.gz'
-    img = nib.load(mask_path)
-    data = img.get_fdata()
+    print("loading multimodal patient data...")
+    gt_filepath = os.path.join(BASE_PATH, 'UCSD-PTGBM-0004_01_BraTS_tumor_seg.nii.gz')
+    img_gt = nib.load(gt_filepath); data_gt = img_gt.get_fdata()
+    best_slice_idx = int(np.argmax(np.sum(data_gt, axis=(0, 1))))
+    print(f"analyzing optimal z-slice: {best_slice_idx}")
 
-    sums = np.sum(data, axis=(0, 1))
-    best_slice_idx = int(np.argmax(sums))
-    print(f"analyzing slice: {best_slice_idx}")
+    target_mask = (data_gt[:, :, best_slice_idx] > 0).astype(float)
+    flair_norm = load_normalized_slice('UCSD-PTGBM-0004_01_FLAIR.nii.gz', best_slice_idx)
 
-    target_mask = data[:, :, best_slice_idx]
-    target_mask = (target_mask > 0).astype(float)
+    core_filepath = os.path.join(BASE_PATH, 'UCSD-PTGBM-0004_01_enhancing_cellular_tumor_seg.nii.gz')
+    u_initial = (nib.load(core_filepath).get_fdata()[:, :, best_slice_idx] > 0).astype(float)
 
-    # calculating tumor centroid to locate 'patient zero'
-    coords = np.argwhere(target_mask == 1)
-    if len(coords) > 0:
-        start_x, start_y = coords.mean(axis=0).astype(int)
-    else:
-        start_x, start_y = target_mask.shape[0] // 2, target_mask.shape[1] // 2
+    adc_norm = load_normalized_slice('UCSD-PTGBM-0004_01_ADC_vendor.nii.gz', best_slice_idx)
+    base_diff_map = 0.01 * adc_norm
+    base_diff_map[flair_norm < 0.1] = 0.0
+    asl_norm = load_normalized_slice('UCSD-PTGBM-0004_01_ASL_CBF.nii.gz', best_slice_idx)
+    base_rho_map = 0.1 * asl_norm
 
-    # kontrolny print
-    print(f"\n!!! START POINT CALCULATED AT: X={start_x}, Y={start_y} !!!\n")
+    print("\n--- stage 1: coarse grid search ---")
+    best_coarse_dice, best_start_d, best_start_rho = -1.0, 1.0, 1.0
+    for test_d in [0.25, 0.5, 1.0]:
+        for test_rho in [0.5, 1.5, 3.0]:
+            score, _ = evaluate_cost(
+                base_diff_map, base_rho_map, u_initial, test_d, test_rho, DX, SIMULATION_STEPS, target_mask, flair_norm
+            )
+            print(f"coarse: d={test_d}, rho={test_rho} -> dice: {score:.4f}")
+            if score > best_coarse_dice:
+                best_coarse_dice, best_start_d, best_start_rho = score, test_d, test_rho
 
-    print("loading flair anatomy...")
-    flair_path = '/Users/marysianowakowska/Downloads/TCIA_testdataset/testset_TCIA/UCSD-PTGBM-0004_01/UCSD-PTGBM-0004_01_FLAIR.nii.gz'
-    flair_img = nib.load(flair_path)
-    flair_data = flair_img.get_fdata()
-
-    flair_slice = flair_data[:, :, best_slice_idx]
-
-    flair_max = np.max(flair_slice)
-    if flair_max > 0:
-        flair_normalized = flair_slice / flair_max
-    else:
-        flair_normalized = flair_slice
-
-    base_d = 0.005
-    diff_map = base_d * (0.01 + 0.99 * flair_normalized)
-
-    # skull barrier
-    diff_map[flair_normalized < 0.1] = 0.0
-
-    # safe time step calculation (CFL condition)
-    max_d = np.max(diff_map)
-    limit_k = DX ** 2 / (4 * max_d)
-    dt = limit_k * 0.5
-    print(f"safe dt calculated: {dt:.5f}")
-
-    print("\nstarting custom intelligent optimization...")
-    best_d_mult, best_rho, best_dice, best_sim = custom_hill_climbing(
-        target_mask=target_mask,
-        base_diff_map=diff_map,
-        dt=dt,
-        dx=DX,
-        steps=SIMULATION_STEPS,
-        start_x=start_x,
-        start_y=start_y
+    print("\n--- stage 2: fine hill climbing ---")
+    best_d_mult, best_rho_mult, best_dice, best_sim = custom_hill_climbing(
+        target_mask, base_diff_map, base_rho_map, u_initial, DX, SIMULATION_STEPS, best_start_d, best_start_rho, flair_norm
     )
 
-    print("\n--- optimization finished ---")
-    print(f"optimal diffusion multiplier: {best_d_mult:.3f}")
-    print(f"optimal proliferation (rho): {best_rho:.4f}")
-    print(f"final dice score: {best_dice:.4f}")
-    print("-----------------------------\n")
+    print(f"\nFINAL DICE: {best_dice:.4f}")
 
-    # --- 5. VISUALIZATION PHASE ---
-    fig, axes = plt.subplots(1, 2, figsize=(10, 5))
+    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+    display_flair = flair_norm * 0.5
 
-    # --- LEFT PLOT: Ground Truth on Flair Anatomy ---
-    # Plot base flair brain first (using gray/bone cmap)
-    axes[0].imshow(flair_normalized.T, cmap='bone', origin='lower')
+    axes[0].imshow(display_flair.T, cmap='gray', origin='lower')
+    axes[0].imshow(np.ma.masked_where(target_mask == 0, target_mask).T, cmap='autumn', origin='lower', alpha=0.8)
+    axes[0].set_title("ground truth")
 
-    # Create masked ground truth to allow the brain background to show through
-    # we make binary mask of 1s white, and 0s transparent
-    gt_mask_display = np.ma.masked_where(target_mask == 0, target_mask)
-    axes[0].imshow(gt_mask_display.T, cmap='bone', vmin=0, vmax=1, origin='lower', alpha=0.9)
+    axes[1].imshow(display_flair.T, cmap='gray', origin='lower')
+    axes[1].imshow(np.ma.masked_where(u_initial == 0, u_initial).T, cmap='autumn', origin='lower', alpha=0.8)
+    axes[1].set_title("initial core")
 
-    axes[0].set_title("ground truth (real tumor) on flair")
-    # Mark the centroid
-    axes[0].plot(start_x, start_y, 'ro', markersize=2)
+    axes[2].imshow(display_flair.T, cmap='gray', origin='lower')
+    axes[2].imshow(create_crisp_tumor_mask(best_sim, FINAL_VIS_THRESHOLD).T, cmap='autumn', origin='lower', alpha=0.8)
+    axes[2].set_title(f"result (dice: {best_dice:.2f})")
 
-    # --- RIGHT PLOT: Optimized Crisp Simulation on Flair Anatomy ---
-    # Plot base flair brain as base layer
-    axes[1].imshow(flair_normalized.T, cmap='bone', origin='lower')
-
-    # Convert fuzzy simulated distribution to a crisp, binarized white mask
-    # We use mcolors.ListedColormap to plot in crisp white
-    crisp_sim_mask = create_crisp_tumor_mask(best_sim, FINAL_VIS_THRESHOLD)
-
-    white_cmap = mcolors.ListedColormap(['white']) # only crisp white, no heat colors
-
-    # Plot optimized binarized simulation in crisp white on top
-    axes[1].imshow(crisp_sim_mask.T, cmap=white_cmap, origin='lower', alpha=0.8)
-    axes[1].set_title("optimized crisp simulation on flair")
-
-    plt.show()
-
+    for ax in axes: ax.set_xlabel("x [px]"); ax.set_ylabel("y [px]")
+    plt.tight_layout(); plt.show()
 
 if __name__ == "__main__":
     main()
